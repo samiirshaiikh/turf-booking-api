@@ -7,6 +7,13 @@ const cors = require('cors');
 const { createClient } = require('@libsql/client');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const Razorpay = require('razorpay');
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID || '',
+  key_secret: process.env.RAZORPAY_KEY_SECRET || '',
+});
 
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
@@ -34,6 +41,9 @@ async function init() {
     duration INTEGER NOT NULL,
     notes TEXT,
     status TEXT DEFAULT 'confirmed',
+    amount INTEGER,
+    razorpayOrderId TEXT,
+    razorpayPaymentId TEXT,
     createdAt TEXT DEFAULT CURRENT_TIMESTAMP
   )`);
   await db.execute(`CREATE TABLE IF NOT EXISTS blocked_slots (
@@ -160,7 +170,7 @@ app.get('/api/bookings', requireAuth, async (req, res) => {
 });
 
 app.post('/api/bookings', async (req, res) => {
-  const { name, phone, email, date, startHour, duration, notes } = req.body || {};
+  const { name, phone, email, date, startHour, duration, notes, amount, requirePayment } = req.body || {};
   if (!name || !phone || !date || startHour === undefined || !duration) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
@@ -173,13 +183,69 @@ app.post('/api/bookings', async (req, res) => {
   }
 
   const id = Date.now();
+  const initialStatus = requirePayment ? 'pending_payment' : 'confirmed';
   await db.execute({
-    sql: `INSERT INTO bookings (id,name,phone,email,date,startHour,duration,notes,status)
-          VALUES (?,?,?,?,?,?,?,?,?)`,
-    args: [id, name, phone, email || '', date, sh, dur, notes || '', 'confirmed'],
+    sql: `INSERT INTO bookings (id,name,phone,email,date,startHour,duration,notes,status,amount)
+          VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    args: [id, name, phone, email || '', date, sh, dur, notes || '', initialStatus, amount || null],
   });
   const result = await db.execute({ sql: 'SELECT * FROM bookings WHERE id = ?', args: [id] });
   res.json(result.rows[0]);
+});
+
+// Releases a booking that's still awaiting payment (e.g. user closed the
+// Razorpay popup without paying) so the slot becomes available again.
+// Only works on bookings still in 'pending_payment' status — safe to be public.
+app.post('/api/bookings/:id/release', async (req, res) => {
+  const id = Number(req.params.id);
+  const result = await db.execute({ sql: 'SELECT * FROM bookings WHERE id = ?', args: [id] });
+  const booking = result.rows[0];
+  if (!booking || booking.status !== 'pending_payment') {
+    return res.status(400).json({ error: 'Booking cannot be released' });
+  }
+  await db.execute({ sql: `UPDATE bookings SET status = 'cancelled' WHERE id = ?`, args: [id] });
+  res.json({ ok: true });
+});
+
+// ====================== PAYMENTS (Razorpay) ======================
+app.post('/api/payment/create-order', async (req, res) => {
+  const { amount, bookingId } = req.body || {};
+  if (!amount || !bookingId) return res.status(400).json({ error: 'amount and bookingId required' });
+  try {
+    const order = await razorpay.orders.create({
+      amount: Math.round(Number(amount) * 100), // amount in paise
+      currency: 'INR',
+      receipt: 'booking_' + bookingId,
+      notes: { bookingId: String(bookingId) },
+    });
+    await db.execute({ sql: 'UPDATE bookings SET razorpayOrderId = ? WHERE id = ?', args: [order.id, bookingId] });
+    res.json({ orderId: order.id, amount: order.amount, currency: order.currency, keyId: process.env.RAZORPAY_KEY_ID });
+  } catch (e) {
+    console.error('Razorpay order creation failed:', e);
+    res.status(500).json({ error: 'Could not initiate payment' });
+  }
+});
+
+app.post('/api/payment/verify', async (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, bookingId } = req.body || {};
+  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !bookingId) {
+    return res.status(400).json({ error: 'Missing payment verification fields' });
+  }
+  const expectedSignature = crypto
+    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '')
+    .update(razorpay_order_id + '|' + razorpay_payment_id)
+    .digest('hex');
+
+  if (expectedSignature !== razorpay_signature) {
+    return res.status(400).json({ error: 'Payment verification failed' });
+  }
+
+  await db.execute({
+    sql: `UPDATE bookings SET status = 'confirmed', razorpayPaymentId = ? WHERE id = ?`,
+    args: [razorpay_payment_id, bookingId],
+  });
+  const result = await db.execute({ sql: 'SELECT * FROM bookings WHERE id = ?', args: [bookingId] });
+  res.json({ ok: true, booking: result.rows[0] });
 });
 
 app.put('/api/bookings/:id', requireAuth, async (req, res) => {
