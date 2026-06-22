@@ -57,6 +57,23 @@ async function init() {
     passwordHash TEXT NOT NULL
   )`);
 
+  // Migration: older deployments may have a bookings table created before
+  // the amount/razorpay columns existed. Add them if missing (safe to run
+  // every startup — errors for "column already exists" are ignored).
+  const migrations = [
+    `ALTER TABLE bookings ADD COLUMN amount INTEGER`,
+    `ALTER TABLE bookings ADD COLUMN razorpayOrderId TEXT`,
+    `ALTER TABLE bookings ADD COLUMN razorpayPaymentId TEXT`,
+  ];
+  for (const sql of migrations) {
+    try {
+      await db.execute(sql);
+      console.log('Migration applied:', sql);
+    } catch (e) {
+      // Column already exists — expected on every startup after the first. Ignore.
+    }
+  }
+
   const adminCount = await db.execute('SELECT COUNT(*) AS c FROM admins');
   if (adminCount.rows[0].c === 0) {
     const defaultUser = process.env.ADMIN_USER || 'admin';
